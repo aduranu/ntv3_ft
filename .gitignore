@@ -1,0 +1,22 @@
+# build / cache
+__pycache__/
+*.py[cod]
+*.egg-info/
+.eggs/
+build/
+dist/
+
+# checkpoints + per-run logs (regenerated each run)
+best.pkl
+*.pkl
+_test_run_*.out
+*.log
+
+# dataset + raw downloads (multi-GB; rebuild with `python data.py --build`)
+data/
+jores21-raw/
+
+# editor / OS
+.vscode/
+.idea/
+.DS_Store
