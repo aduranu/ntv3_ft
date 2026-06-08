@@ -47,41 +47,90 @@ with open(_config_path, "rb") as f:
 
 DATA_DIR = os.path.expanduser(_config["data_dir"])
 MODEL_NAME = _config["model_name"]
-TISSUE = _config["tissue"]
-MODE = _config["mode"]
+# env overrides let concurrent jobs pick tissue/mode without racing on config.toml
+TISSUE = os.environ.get("NTV3_TISSUE", _config["tissue"])
+MODE = os.environ.get("NTV3_MODE", _config["mode"])
+# if set, skip stage 1 entirely and load the saved stage-1 head from this path
+RESUME_STAGE1_CKPT = os.environ.get("NTV3_RESUME_STAGE1", "")
 
 
 # ---------------------------------------------------------------------------
 # Hyperparameters
 # ---------------------------------------------------------------------------
 
+def _envf(name, default):  # float env override
+    return float(os.environ.get(name, default))
+
+def _envi(name, default):  # int env override
+    return int(os.environ.get(name, default))
+
+
 HIDDEN_SIZE = 1024
 DROPOUT = 0.2
 
-BATCH_SIZE = 128
-LEARNING_RATE = 5e-4
-WEIGHT_DECAY = 0.0
+BATCH_SIZE = _envi("NTV3_BATCH_SIZE", 256)
+LEARNING_RATE = 5e-4            # stage-1 head lr (frozen backbone)
+WEIGHT_DECAY = _envf("NTV3_WEIGHT_DECAY", 0.01)   # ref recipe used 0.01 (was 0.0)
 
-# augmentations
-REVERSE_COMPLEMENT = False
+# augmentations — reference recipe: RC on, shift always, ±50 bp
+REVERSE_COMPLEMENT = os.environ.get("NTV3_RC", "1") == "1"
 RC_PROB = 0.5
 RANDOM_SHIFT = True
-SHIFT_PROB = 0.5
-MAX_SHIFT = 25
+SHIFT_PROB = _envf("NTV3_SHIFT_PROB", 1.0)
+MAX_SHIFT = _envi("NTV3_MAX_SHIFT", 50)
 
 # two-stage
 STAGE1_EPOCHS = 100              # hard cap; early stopping will usually finish sooner
 STAGE2_ENABLED = True
-STAGE2_LR = 1e-5
-STAGE2_EPOCHS = 50
+STAGE2_EPOCHS = 50              # max epochs (wall-time budget usually binds first)
+
+# stage-2 wall-time LR schedule (ported from ~/autotune ntv3 reference):
+#   linear warmup -> constant -> linear warmdown to FINAL_LR_FRAC*base
+#   head lr = base * mult ;  backbone lr = head lr * BACKBONE_LR_SCALE
+# sweep winner: uniform LR (scale 1.0) at base 4e-4 beat the reference's 2e-4/0.1 discriminative
+STAGE2_BASE_LR = _envf("NTV3_S2_BASE_LR", 4e-4)
+BACKBONE_LR_SCALE = _envf("NTV3_S2_BB_SCALE", 1.0)
+STAGE2_TIME_BUDGET = _envf("NTV3_S2_TIME_BUDGET", 1600.0)   # seconds for stage 2
+WARMUP_RATIO = _envf("NTV3_S2_WARMUP", 0.05)
+WARMDOWN_RATIO = _envf("NTV3_S2_WARMDOWN", 0.30)
+FINAL_LR_FRAC = _envf("NTV3_S2_FINAL_FRAC", 0.01)
 
 EARLY_STOPPING_PATIENCE = 5      # consecutive epochs of no val_r -> improvement stop stage 1
+STAGE2_EARLY_STOPPING_PATIENCE = _envi("NTV3_S2_PATIENCE", 8)  # looser: let the warmdown run
 
 # encoder output positions: conv_tower downsamples by 128×
 SEQ_LEN = PROMOTER_LENGTH if MODE == "promoter_only" else SEQUENCE_LENGTH
 N_ENC_POSITIONS = math.ceil(SEQ_LEN / 128)
 
-CHECKPOINT_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "best.pkl")
+# optional run tag so parallel sweep trials write distinct output files
+RUN_TAG = os.environ.get("NTV3_RUN_TAG", "")
+_suffix = f"{TISSUE}_{MODE}" + (f"_{RUN_TAG}" if RUN_TAG else "")
+
+_ckpt_dir = os.path.dirname(os.path.abspath(__file__))
+# per-(tissue,mode[,tag]) names so concurrent jobs never clobber each other
+CHECKPOINT_PATH = os.path.join(_ckpt_dir, f"best_{_suffix}.pkl")
+STAGE1_CHECKPOINT_PATH = os.path.join(_ckpt_dir, f"best_stage1_{TISSUE}_{MODE}.pkl")
+# per-epoch learning-curve log (stage, epoch, train_loss, val_loss, val_pearson, head_lr)
+METRICS_CSV_PATH = os.path.join(_ckpt_dir, f"metrics_{_suffix}.csv")
+
+
+# wall-time LR multiplier: warmup -> constant -> linear warmdown (ref training_jax.py)
+def lr_multiplier(progress: float) -> float:
+    if progress < WARMUP_RATIO:
+        return progress / WARMUP_RATIO if WARMUP_RATIO > 0 else 1.0
+    elif progress < 1.0 - WARMDOWN_RATIO:
+        return 1.0
+    cooldown = (1.0 - progress) / WARMDOWN_RATIO
+    return cooldown * 1.0 + (1 - cooldown) * FINAL_LR_FRAC
+
+
+def _log_metrics(stage: int, epoch: int, train_loss: float, val_loss: float,
+                 val_pr: float, head_lr: float = 0.0) -> None:
+    new = not os.path.exists(METRICS_CSV_PATH)
+    with open(METRICS_CSV_PATH, "a") as f:
+        if new:
+            f.write("stage,epoch,train_loss,val_loss,val_pearson,head_lr\n")
+        f.write(f"{stage},{epoch},{train_loss:.6f},{val_loss:.6f},{val_pr:.6f},{head_lr:.3e}\n")
 
 
 # ---------------------------------------------------------------------------
@@ -221,6 +270,10 @@ def evaluate(model, head, loader, eval_step_fn: Callable) -> tuple[float, float]
 if __name__ == "__main__":
     t_start = time.time()
 
+    # fresh per-epoch metrics log each run
+    if os.path.exists(METRICS_CSV_PATH):
+        os.remove(METRICS_CSV_PATH)
+
     print("Loading pretrained NTv3...")
     model, tokenizer, config = get_pretrained_ntv3_model(MODEL_NAME, use_bfloat16=True)
     encoder_dim = config.embed_dim
@@ -267,9 +320,8 @@ if __name__ == "__main__":
 
     # -------------------------------------------------------------------
     # Stage 1: frozen backbone, train head only
+    # (skipped entirely when resuming from a saved stage-1 head checkpoint)
     # -------------------------------------------------------------------
-
-    print(f"--- stage 1: frozen backbone, lr={LEARNING_RATE}, patience={EARLY_STOPPING_PATIENCE} epochs ---")
 
     t_train_start = time.time()
     best_val_pearson = -float("inf")
@@ -279,7 +331,24 @@ if __name__ == "__main__":
     stage1_epochs_done = 0
     total_steps = 0
 
-    for epoch in range(STAGE1_EPOCHS):
+    if RESUME_STAGE1_CKPT:
+        print(f"--- stage 1: SKIPPED, resuming head from {RESUME_STAGE1_CKPT} ---")
+        with open(RESUME_STAGE1_CKPT, "rb") as f:
+            _s1 = pickle.load(f)
+        if _s1["config"]["tissue"] != TISSUE or _s1["config"]["mode"] != MODE:
+            raise RuntimeError(
+                f"stage-1 ckpt is {_s1['config']['tissue']}/{_s1['config']['mode']} "
+                f"but this run is {TISSUE}/{MODE}"
+            )
+        nnx.update(head, jax.tree.map(jnp.asarray, _s1["head_state"]))
+        best_head_state = jax.tree.map(jnp.copy, nnx.state(head))
+        best_val_pearson = float(_s1["val_pearson"])
+        print(f"loaded stage-1 head | val_pearson={best_val_pearson:.6f} "
+              f"test_pearson={_s1.get('test_pearson', float('nan')):.6f}")
+    else:
+        print(f"--- stage 1: frozen backbone, lr={LEARNING_RATE}, patience={EARLY_STOPPING_PATIENCE} epochs ---")
+
+    for epoch in (range(STAGE1_EPOCHS) if not RESUME_STAGE1_CKPT else range(0)):
         epoch_loss = 0.0
         epoch_batches = 0
 
@@ -317,6 +386,7 @@ if __name__ == "__main__":
             f"elapsed: {time.time() - t_train_start:.0f}s",
             flush=True,
         )
+        _log_metrics(1, epoch, avg_loss, val_loss, val_pr)
 
         if (epoch + 1) % 5 == 0:
             gc.collect()
@@ -325,7 +395,48 @@ if __name__ == "__main__":
             print(f"early stopped after {stage1_epochs_done} epochs")
             break
 
-    print(f"stage 1 done: {stage1_epochs_done} epochs, best val_pearson: {best_val_pearson:.6f}")
+    if not RESUME_STAGE1_CKPT:
+        print(f"stage 1 done: {stage1_epochs_done} epochs, best val_pearson: {best_val_pearson:.6f}")
+
+    # -------------------------------------------------------------------
+    # Save stage-1-only checkpoint (head trained on FROZEN pretrained conv
+    # features; backbone is unchanged from pretrained, so only the head is
+    # persisted). Evaluate test now, before stage 2 mutates anything.
+    # Skipped when resuming — the stage-1 checkpoint already exists.
+    # -------------------------------------------------------------------
+    if not RESUME_STAGE1_CKPT:
+        if best_head_state is not None:
+            nnx.update(head, best_head_state)
+
+        stage1_val_loss, stage1_val_pr = evaluate(model, head, val_loader, eval_step_fn)
+
+        s1_preds, s1_tgts = [], []
+        for tokens_np, targets_np in test_loader:
+            tokens = jnp.array(tokens_np)
+            enc_out = get_embeddings(model, tokens)
+            preds = head(enc_out)
+            s1_preds.append(np.asarray(preds))
+            s1_tgts.append(np.asarray(targets_np))
+        s1_preds = np.concatenate(s1_preds)
+        s1_tgts = np.concatenate(s1_tgts)
+        stage1_test_pearson, _ = pearsonr(s1_preds, s1_tgts)
+        stage1_test_mse = float(np.mean((s1_preds - s1_tgts) ** 2))
+
+        stage1_ckpt = {
+            "head_state": jax.tree.map(np.asarray, nnx.state(head, nnx.Param)),
+            "backbone_state": None,  # frozen during stage 1 == original pretrained weights
+            "val_pearson": best_val_pearson,
+            "test_pearson": float(stage1_test_pearson),
+            "test_mse": stage1_test_mse,
+            "stage": 1,
+            "config": {"tissue": TISSUE, "mode": MODE, "model_name": MODEL_NAME},
+        }
+        with open(STAGE1_CHECKPOINT_PATH, "wb") as f:
+            pickle.dump(stage1_ckpt, f)
+        print(f"stage1_val_pearson:  {best_val_pearson:.6f}")
+        print(f"stage1_test_pearson: {stage1_test_pearson:.6f}")
+        print(f"stage1_test_mse:     {stage1_test_mse:.6f}")
+        print(f"stage1_checkpoint:   {STAGE1_CHECKPOINT_PATH}")
 
     # -------------------------------------------------------------------
     # Stage 2: unfrozen backbone
@@ -337,21 +448,33 @@ if __name__ == "__main__":
         if best_head_state is not None:
             nnx.update(head, best_head_state)
 
+        # inject_hyperparams lets us mutate the LR per-step for the wall-time schedule
         head_tx_s2 = optax.chain(
             optax.clip_by_global_norm(1.0),
-            optax.adamw(learning_rate=STAGE2_LR, weight_decay=WEIGHT_DECAY),
+            optax.inject_hyperparams(optax.adamw)(
+                learning_rate=STAGE2_BASE_LR, weight_decay=WEIGHT_DECAY),
         )
         head_opt = nnx.Optimizer(head, head_tx_s2)
 
         backbone_tx = optax.chain(
             optax.clip_by_global_norm(1.0),
-            optax.adamw(learning_rate=STAGE2_LR, weight_decay=WEIGHT_DECAY),
+            optax.inject_hyperparams(optax.adamw)(
+                learning_rate=STAGE2_BASE_LR * BACKBONE_LR_SCALE, weight_decay=WEIGHT_DECAY),
         )
         backbone_opt = nnx.Optimizer(model, backbone_tx)
 
         train_step_s2 = make_train_step(get_embeddings, freeze_backbone=False)
 
-        print(f"--- stage 2: unfrozen backbone, lr={STAGE2_LR}, {STAGE2_EPOCHS} epochs ---")
+        print(f"--- stage 2: unfrozen backbone | base_lr={STAGE2_BASE_LR:.1e} "
+              f"backbone_scale={BACKBONE_LR_SCALE} | wall-time schedule "
+              f"(warmup={WARMUP_RATIO}, warmdown={WARMDOWN_RATIO}, final={FINAL_LR_FRAC}) "
+              f"budget={STAGE2_TIME_BUDGET:.0f}s | wd={WEIGHT_DECAY} rc={REVERSE_COMPLEMENT} "
+              f"| max_epochs={STAGE2_EPOCHS} patience={STAGE2_EARLY_STOPPING_PATIENCE} ---")
+
+        s2_epochs_since_best = 0
+        t_stage2_start = time.time()
+        cur_head_lr = STAGE2_BASE_LR
+        timed_out = False
 
         for epoch in range(STAGE2_EPOCHS):
             epoch_loss = 0.0
@@ -360,6 +483,13 @@ if __name__ == "__main__":
             for batch_idx, (tokens_np, targets_np) in enumerate(train_loader):
                 tokens = jnp.array(tokens_np)
                 targets = jnp.array(targets_np)
+
+                # per-step wall-time LR schedule (head) + discriminative backbone LR
+                progress = (time.time() - t_stage2_start) / STAGE2_TIME_BUDGET
+                cur_head_lr = STAGE2_BASE_LR * max(lr_multiplier(progress), 0.0)
+                head_opt.opt_state[1].hyperparams["learning_rate"].value = jnp.array(cur_head_lr)
+                backbone_opt.opt_state[1].hyperparams["learning_rate"].value = jnp.array(
+                    cur_head_lr * BACKBONE_LR_SCALE)
 
                 loss, _ = train_step_s2(model, head, head_opt, backbone_opt, tokens, targets)
                 loss_val = float(loss)
@@ -371,6 +501,10 @@ if __name__ == "__main__":
                 epoch_batches += 1
                 total_steps += 1
 
+                if (time.time() - t_stage2_start) >= STAGE2_TIME_BUDGET:
+                    timed_out = True
+                    break
+
             val_loss, val_pr = evaluate(model, head, val_loader, eval_step_fn)
             is_best = val_pr > best_val_pearson
 
@@ -378,6 +512,9 @@ if __name__ == "__main__":
                 best_val_pearson = val_pr
                 best_head_state = jax.tree.map(jnp.copy, nnx.state(head))
                 best_backbone_state = jax.tree.map(jnp.copy, nnx.state(model))
+                s2_epochs_since_best = 0
+            else:
+                s2_epochs_since_best += 1
 
             stage2_epochs_done = epoch + 1
             avg_loss = epoch_loss / max(epoch_batches, 1)
@@ -385,13 +522,24 @@ if __name__ == "__main__":
             print(
                 f"epoch {stage1_epochs_done + epoch:3d} {star} | "
                 f"train_loss: {avg_loss:.6f} | "
+                f"val_loss: {val_loss:.4f} | "
                 f"val_r: {val_pr:.4f} (best: {best_val_pearson:.4f}) | "
-                f"elapsed: {time.time() - t_train_start:.0f}s",
+                f"lr: {cur_head_lr:.2e} | "
+                f"t: {time.time() - t_stage2_start:.0f}/{STAGE2_TIME_BUDGET:.0f}s",
                 flush=True,
             )
+            _log_metrics(2, stage1_epochs_done + epoch, avg_loss, val_loss, val_pr, cur_head_lr)
 
             if (epoch + 1) % 5 == 0:
                 gc.collect()
+
+            if timed_out:
+                print(f"stage 2 wall-time budget reached after {stage2_epochs_done} epochs")
+                break
+
+            if s2_epochs_since_best >= STAGE2_EARLY_STOPPING_PATIENCE:
+                print(f"stage 2 early stopped after {stage2_epochs_done} epochs")
+                break
 
         print(f"stage 2 done: {stage2_epochs_done} epochs, best val_pearson: {best_val_pearson:.6f}")
 

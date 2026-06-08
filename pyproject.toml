@@ -32,6 +32,9 @@ dependencies = [
     "pandas",
     "scipy",
     "tqdm",
+
+    # learning-curve / sweep result plotting (curves.py, final_plot.py)
+    "matplotlib",
 ]
 
 [tool.uv.sources]
