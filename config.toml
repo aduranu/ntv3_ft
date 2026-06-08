@@ -1,7 +1,0 @@
-# Jores21 fine-tuning configuration for the NTv3 pretrained conv-tower.
-# Edit `tissue` and `mode` to switch experiment.
-
-data_dir = "./data"
-tissue = "leaf"               # "leaf" or "proto"
-mode = "combined"             # "combined" | "enhancer" | "promoter_only"
-model_name = "NTv3_650M_pre"  # pretrained NTv3 checkpoint name

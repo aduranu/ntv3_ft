@@ -1,0 +1,6 @@
+{
+  "data_dir": "./data",
+  "tissue": "leaf",
+  "mode": "combined",
+  "model_name": "NTv3_650M_pre"
+}

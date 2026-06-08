@@ -12,6 +12,18 @@ best.pkl
 _test_run_*.out
 *.log
 
+# run artifacts: SLURM logs, per-epoch metrics, generated plots, scratch state
+*.out
+sweep_logs/
+metrics_*.csv
+curves*.csv
+*.png
+sweep_jobs.txt
+sweep_ext_jobs.txt
+.last_jobs
+.smoke_job
+.verify_job
+
 # dataset + raw downloads (multi-GB; rebuild with `python data.py --build`)
 data/
 jores21-raw/
@@ -20,3 +32,11 @@ jores21-raw/
 .vscode/
 .idea/
 .DS_Store
+
+# experiment scratch (sweep configs, one-off collectors, job-id files)
+sweep_configs/
+_collect_reg.py
+.reg_jobs
+.s1curve_jobs
+.run_job
+.reg_smoke

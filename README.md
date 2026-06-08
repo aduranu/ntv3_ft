@@ -17,7 +17,9 @@ This is a self-contained extract — no dependence on the original autotune rese
 - Trains with **MSE loss**, AdamW, gradient clipping, in two stages:
   - **Stage 1**: backbone frozen, head trained until `val_pearson` plateaus
     (early stopping, default patience = 5 epochs).
-  - **Stage 2**: backbone unfrozen, both at `1e-5`, runs up to `STAGE2_EPOCHS=50`.
+  - **Stage 2**: backbone unfrozen, trained under a wall-time LR schedule
+    (warmup → constant → warmdown), peak LR ~4e-4, with early stopping + a wall-clock
+    budget. This tuned recipe lifts test Pearson ~+0.03–0.04 over the frozen-stage-1 head.
 
 ## Layout
 
@@ -25,9 +27,11 @@ This is a self-contained extract — no dependence on the original autotune rese
 ntv3_ft/
 ├── README.md
 ├── pyproject.toml     # env spec — JAX + flax/nnx + optax + nucleotide_transformer pkg
-├── config.toml        # tissue, mode, data_dir, model_name
+├── config.json        # experiment selection: tissue, mode, data_dir, model_name
 ├── data.py            # Jores21 Dataset + dataloaders + NTv3 collate + dataset builder CLI
-└── finetune.py        # main script — head, train_step / eval_step, two-stage loop
+├── finetune.py        # main script — head, two-stage loop, hardcoded per-stage HPs
+├── plot_curves.py     # plot train/val loss curves from the run's metrics CSV
+└── run_finetune.sbatch # SLURM launcher
 ```
 
 ## Install
@@ -61,35 +65,54 @@ in `./data/` (`jores21_{leaf,proto}_{35SEnh,noEnh}_{train,test}.tsv`).
 python finetune.py
 ```
 
-Reads `config.toml`. Default config is `tissue = "leaf"`, `mode = "combined"`. Change
-`tissue` to `"proto"` to swap to the protoplast assay. `mode` choices:
+That's it — one run does **both** stages with the validated hyperparameters and saves
+**both** checkpoints:
 
-- `"combined"` — train on both `35SEnh` and `noEnh` data, constructs are built with
-  per-row enhancer flag. Recommended (broadest data coverage).
-- `"enhancer"` — train on `35SEnh` only, with the 35S enhancer prepended to constructs.
-- `"promoter_only"` — train on the raw 170 bp promoter sequences without construct
-  context.
+- **stage 1 ("probing")** — backbone frozen, train head only → `best_stage1_<tissue>_<mode>.pkl`
+- **stage 2 ("full fine-tune")** — backbone unfrozen, tuned recipe + wall-time LR
+  schedule → `best_<tissue>_<mode>.pkl`
 
-Outputs `best.pkl` (pickle of head + optional backbone state + summary). Final metrics
-print as `val_pearson:`, `test_pearson:`, `test_mse:`, `peak_vram_mb:`.
+It also writes `metrics_<tissue>_<mode>.csv` (per-epoch `train_loss,val_loss,val_pearson,
+head_lr` for both stages) and prints `val_pearson:`, `test_pearson:`, `test_mse:`
+(held-out, **gene-split** test set), `peak_vram_mb:`.
 
-## Hyperparameter tuning
+Pick the experiment in **`config.json`** (no code edits, no env vars):
 
-Edit constants at the top of `finetune.py`:
+```json
+{ "data_dir": "./data", "tissue": "leaf", "mode": "combined", "model_name": "NTv3_650M_pre" }
+```
 
-| Name | Default | What it does |
-|---|---|---|
-| `HIDDEN_SIZE` | 1024 | head MLP width |
-| `DROPOUT` | 0.2 | head dropout |
-| `BATCH_SIZE` | 128 | batch size |
-| `LEARNING_RATE` | 5e-4 | stage 1 lr (head only) |
-| `STAGE1_EPOCHS` | 100 | epoch cap; early stopping usually triggers first |
-| `STAGE2_LR` | 1e-5 | stage 2 lr (head + backbone) |
-| `STAGE2_EPOCHS` | 50 | stage 2 epoch cap |
-| `STAGE2_ENABLED` | True | set to `False` to skip stage 2 |
-| `EARLY_STOPPING_PATIENCE` | 5 | consecutive epochs without val_r improvement → break stage 1 |
-| `REVERSE_COMPLEMENT` | False | random RC augmentation |
-| `RANDOM_SHIFT` | True | random circular shift augmentation (±25 bp) |
+- `tissue`: `"leaf"` or `"proto"`.
+- `mode`: `"combined"` (both `35SEnh` + `noEnh`; recommended), `"enhancer"` (35S only),
+  or `"promoter_only"` (raw 170 bp promoters).
+
+To train only the probing head, set `RUN_STAGE2 = False` at the top of `finetune.py`.
+
+Plot the learning curves after a run with `python plot_curves.py` (reads the metrics CSV
+for the tissue/mode in `config.json`, writes `loss_curves.png`).
+
+## Hyperparameters
+
+All hyperparameters are **hardcoded** near the top of `finetune.py`, separated per stage
+(`S1_*` for the frozen-backbone probe, `S2_*` for the full fine-tune) — no env vars. The
+defaults are the validated recipe behind the reported test Pearson (leaf 0.885 / proto
+0.875, vs frozen-stage-1 0.843 / 0.841). Edit there only if you want to experiment.
+
+| Stage 1 (`S1_*`) | Default | | Stage 2 (`S2_*`) | Default |
+|---|---|---|---|---|
+| `S1_BATCH_SIZE` | 128 | | `S2_BATCH_SIZE` | 256 (~47 GB VRAM) |
+| `S1_LR` | 5e-4 (constant) | | `S2_BASE_LR` | 4e-4 (peak) |
+| `S1_WEIGHT_DECAY` | 0.0 | | `S2_BACKBONE_LR_SCALE` | 1.0 (uniform) |
+| `S1_REVERSE_COMPLEMENT` | False | | `S2_WEIGHT_DECAY` | 0.01 |
+| `S1_SHIFT_PROB`/`S1_MAX_SHIFT` | 0.5 / 25 | | `S2_REVERSE_COMPLEMENT` | True |
+| `S1_MAX_EPOCHS` | 100 | | `S2_SHIFT_PROB`/`S2_MAX_SHIFT` | 1.0 / 50 |
+| `S1_EARLY_STOPPING_PATIENCE` | 5 | | `S2_TIME_BUDGET` | 2400 s (schedule span) |
+| `HIDDEN_SIZE` / `DROPOUT` | 1024 / 0.2 | | `S2_WARMUP`/`S2_WARMDOWN`/`S2_FINAL` | 0.05 / 0.30 / 0.01 |
+| | | | `S2_MAX_EPOCHS` / `S2_EARLY_STOPPING_PATIENCE` | 50 / 8 |
+
+Stage 2 uses a wall-time LR schedule (linear **warmup → constant → linear warmdown** to
+1% of peak) spanning `S2_TIME_BUDGET` seconds, with the head at the scheduled LR and the
+backbone at `S2_BACKBONE_LR_SCALE ×` that.
 
 ## How the encoder is isolated
 

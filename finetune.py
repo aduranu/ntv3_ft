@@ -5,9 +5,14 @@ Uses the *pretrained* NTv3 checkpoint and taps only the conv-tower features
 (embed_layer -> stem -> conv_tower) — the transformer stack is loaded but never
 executed. A small attention-pool MLP head is trained on those features.
 
-Two-stage training:
-  stage 1 — backbone frozen, train head only with MSE loss and early stopping
-  stage 2 — backbone unfrozen, lower LR, continues from best stage-1 head
+One run does both stages and saves both checkpoints:
+  stage 1 ("probing") — backbone frozen, train head only; light augmentation.
+                        -> best_stage1_<tissue>_<mode>.pkl
+  stage 2 ("full")    — backbone unfrozen, tuned recipe + wall-time LR schedule.
+                        -> best_<tissue>_<mode>.pkl
+
+Hyperparameters below are the validated values (separated per stage); just run it.
+Experiment selection (tissue / mode / paths) lives in config.json.
 
 Usage: python finetune.py
 """
@@ -15,11 +20,11 @@ Usage: python finetune.py
 from __future__ import annotations
 
 import gc
+import json
 import math
 import os
 import pickle
 import time
-import tomllib
 from collections.abc import Callable
 
 import jax
@@ -38,12 +43,12 @@ from data import (
 
 
 # ---------------------------------------------------------------------------
-# Config
+# Config — experiment selection only (HPs are hardcoded below)
 # ---------------------------------------------------------------------------
 
-_config_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "config.toml")
-with open(_config_path, "rb") as f:
-    _config = tomllib.load(f)
+_config_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "config.json")
+with open(_config_path) as f:
+    _config = json.load(f)
 
 DATA_DIR = os.path.expanduser(_config["data_dir"])
 MODEL_NAME = _config["model_name"]
@@ -52,36 +57,70 @@ MODE = _config["mode"]
 
 
 # ---------------------------------------------------------------------------
-# Hyperparameters
+# Hyperparameters — validated values, separated per stage. Edit here only.
 # ---------------------------------------------------------------------------
 
 HIDDEN_SIZE = 1024
 DROPOUT = 0.2
 
-BATCH_SIZE = 128
-LEARNING_RATE = 5e-4
-WEIGHT_DECAY = 0.0
+# --- Stage 1: frozen backbone, train head ("probing"). Light augmentation. ---
+S1_BATCH_SIZE = 128
+S1_LR = 5e-4                    # constant head LR
+S1_WEIGHT_DECAY = 0.0
+S1_REVERSE_COMPLEMENT = False
+S1_RC_PROB = 0.5
+S1_RANDOM_SHIFT = True
+S1_SHIFT_PROB = 0.5
+S1_MAX_SHIFT = 25
+S1_MAX_EPOCHS = 100            # hard cap; early stopping usually finishes sooner
+S1_EARLY_STOPPING_PATIENCE = 5
 
-# augmentations
-REVERSE_COMPLEMENT = False
-RC_PROB = 0.5
-RANDOM_SHIFT = True
-SHIFT_PROB = 0.5
-MAX_SHIFT = 25
-
-# two-stage
-STAGE1_EPOCHS = 100              # hard cap; early stopping will usually finish sooner
-STAGE2_ENABLED = True
-STAGE2_LR = 1e-5
-STAGE2_EPOCHS = 50
-
-EARLY_STOPPING_PATIENCE = 5      # consecutive epochs of no val_r -> improvement stop stage 1
+# --- Stage 2: unfrozen backbone, full fine-tune. Tuned recipe. ---
+RUN_STAGE2 = True             # set False for a stage-1-only ("probe-only") run
+S2_BATCH_SIZE = 256
+S2_BASE_LR = 4e-4             # peak head LR (sweep winner; robust across leaf/proto)
+S2_BACKBONE_LR_SCALE = 1.0   # backbone LR = base * this (uniform LR won the sweep)
+S2_WEIGHT_DECAY = 0.01
+S2_REVERSE_COMPLEMENT = True
+S2_RC_PROB = 0.5
+S2_RANDOM_SHIFT = True
+S2_SHIFT_PROB = 1.0
+S2_MAX_SHIFT = 50
+S2_MAX_EPOCHS = 50           # hard cap; wall-time budget usually binds first
+S2_EARLY_STOPPING_PATIENCE = 8
+# wall-time LR schedule: linear warmup -> constant -> linear warmdown to FINAL*base
+S2_TIME_BUDGET = 2400.0      # stage-2 wall-clock seconds the schedule spans
+S2_WARMUP_RATIO = 0.05
+S2_WARMDOWN_RATIO = 0.30
+S2_FINAL_LR_FRAC = 0.01
 
 # encoder output positions: conv_tower downsamples by 128×
 SEQ_LEN = PROMOTER_LENGTH if MODE == "promoter_only" else SEQUENCE_LENGTH
 N_ENC_POSITIONS = math.ceil(SEQ_LEN / 128)
 
-CHECKPOINT_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "best.pkl")
+_dir = os.path.dirname(os.path.abspath(__file__))
+STAGE1_CHECKPOINT_PATH = os.path.join(_dir, f"best_stage1_{TISSUE}_{MODE}.pkl")  # probing head
+CHECKPOINT_PATH = os.path.join(_dir, f"best_{TISSUE}_{MODE}.pkl")                # full fine-tune
+METRICS_CSV_PATH = os.path.join(_dir, f"metrics_{TISSUE}_{MODE}.csv")            # learning curves
+
+
+# wall-time LR multiplier: warmup -> constant -> linear warmdown (stage 2)
+def lr_multiplier(progress: float) -> float:
+    if progress < S2_WARMUP_RATIO:
+        return progress / S2_WARMUP_RATIO if S2_WARMUP_RATIO > 0 else 1.0
+    elif progress < 1.0 - S2_WARMDOWN_RATIO:
+        return 1.0
+    cooldown = (1.0 - progress) / S2_WARMDOWN_RATIO
+    return cooldown * 1.0 + (1 - cooldown) * S2_FINAL_LR_FRAC
+
+
+def _log_metrics(stage: int, epoch: int, train_loss: float, val_loss: float,
+                 val_pr: float, head_lr: float = 0.0) -> None:
+    new = not os.path.exists(METRICS_CSV_PATH)
+    with open(METRICS_CSV_PATH, "a") as f:
+        if new:
+            f.write("stage,epoch,train_loss,val_loss,val_pearson,head_lr\n")
+        f.write(f"{stage},{epoch},{train_loss:.6f},{val_loss:.6f},{val_pr:.6f},{head_lr:.3e}\n")
 
 
 # ---------------------------------------------------------------------------
@@ -214,6 +253,19 @@ def evaluate(model, head, loader, eval_step_fn: Callable) -> tuple[float, float]
     return total_loss / max(len(loader), 1), pearson_r(preds_cat, targets_cat)
 
 
+def test_eval(model, head) -> tuple[float, float]:
+    """scipy Pearson + MSE on the held-out (gene-split) test set."""
+    all_preds, all_tgts = [], []
+    for tokens_np, targets_np in test_loader:
+        enc_out = get_embeddings(model, jnp.array(tokens_np))
+        all_preds.append(np.asarray(head(enc_out)))
+        all_tgts.append(np.asarray(targets_np))
+    preds_np = np.concatenate(all_preds)
+    tgts_np = np.concatenate(all_tgts)
+    r, _ = pearsonr(preds_np, tgts_np)
+    return float(r), float(np.mean((preds_np - tgts_np) ** 2))
+
+
 # ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
@@ -221,10 +273,12 @@ def evaluate(model, head, loader, eval_step_fn: Callable) -> tuple[float, float]
 if __name__ == "__main__":
     t_start = time.time()
 
+    if os.path.exists(METRICS_CSV_PATH):
+        os.remove(METRICS_CSV_PATH)
+
     print("Loading pretrained NTv3...")
     model, tokenizer, config = get_pretrained_ntv3_model(MODEL_NAME, use_bfloat16=True)
     encoder_dim = config.embed_dim
-
     n_backbone = sum(p.size for p in jax.tree.leaves(nnx.state(model, nnx.Param)))
 
     rngs = nnx.Rngs(42)
@@ -238,26 +292,18 @@ if __name__ == "__main__":
     print(f"Dataset: Jores21 {TISSUE} {MODE}")
     print(f"Sequence length: {SEQ_LEN} bp -> {N_ENC_POSITIONS} encoder positions")
     print(f"Encoder dim: {encoder_dim}")
-    print(f"Backbone params: {n_backbone:,} (stage 1 frozen -> {'unfrozen stage 2' if STAGE2_ENABLED else 'stays frozen'})")
-    print(f"Head params: {n_head:,}")
+    print(f"Backbone params: {n_backbone:,} | Head params: {n_head:,}")
 
     collate_fn = make_ntv3_collate_fn(tokenizer)
-    train_loader, val_loader, test_loader = create_dataloaders(
-        data_dir=DATA_DIR, tissue=TISSUE,
-        batch_size=BATCH_SIZE, mode=MODE,
-        reverse_complement=REVERSE_COMPLEMENT, rc_prob=RC_PROB,
-        random_shift=RANDOM_SHIFT, shift_prob=SHIFT_PROB, max_shift=MAX_SHIFT,
+
+    # stage-1 train loader (light aug, small batch); val/test are unaugmented and shared
+    train_loader_s1, val_loader, test_loader = create_dataloaders(
+        data_dir=DATA_DIR, tissue=TISSUE, mode=MODE, batch_size=S1_BATCH_SIZE,
+        reverse_complement=S1_REVERSE_COMPLEMENT, rc_prob=S1_RC_PROB,
+        random_shift=S1_RANDOM_SHIFT, shift_prob=S1_SHIFT_PROB, max_shift=S1_MAX_SHIFT,
         collate_fn=collate_fn, num_workers=0,
     )
 
-    # stage 1 optimizer: head only, constant lr, grad clipping
-    head_tx = optax.chain(
-        optax.clip_by_global_norm(1.0),
-        optax.adamw(learning_rate=LEARNING_RATE, weight_decay=WEIGHT_DECAY),
-    )
-    head_opt = nnx.Optimizer(head, head_tx)
-
-    train_step_s1 = make_train_step(get_embeddings, freeze_backbone=True)
     eval_step_fn = make_eval_step(get_embeddings)
 
     # gc tricks: collect + freeze + disable to avoid 500ms stalls during training
@@ -266,10 +312,18 @@ if __name__ == "__main__":
     gc.disable()
 
     # -------------------------------------------------------------------
-    # Stage 1: frozen backbone, train head only
+    # Stage 1: frozen backbone, train head ("probing")
     # -------------------------------------------------------------------
 
-    print(f"--- stage 1: frozen backbone, lr={LEARNING_RATE}, patience={EARLY_STOPPING_PATIENCE} epochs ---")
+    print(f"--- stage 1 (probing): frozen backbone, lr={S1_LR}, batch={S1_BATCH_SIZE}, "
+          f"rc={S1_REVERSE_COMPLEMENT}, patience={S1_EARLY_STOPPING_PATIENCE} ---")
+
+    head_tx = optax.chain(
+        optax.clip_by_global_norm(1.0),
+        optax.adamw(learning_rate=S1_LR, weight_decay=S1_WEIGHT_DECAY),
+    )
+    head_opt = nnx.Optimizer(head, head_tx)
+    train_step_s1 = make_train_step(get_embeddings, freeze_backbone=True)
 
     t_train_start = time.time()
     best_val_pearson = -float("inf")
@@ -279,27 +333,23 @@ if __name__ == "__main__":
     stage1_epochs_done = 0
     total_steps = 0
 
-    for epoch in range(STAGE1_EPOCHS):
+    for epoch in range(S1_MAX_EPOCHS):
         epoch_loss = 0.0
         epoch_batches = 0
 
-        for batch_idx, (tokens_np, targets_np) in enumerate(train_loader):
+        for tokens_np, targets_np in train_loader_s1:
             tokens = jnp.array(tokens_np)
             targets = jnp.array(targets_np)
-
             loss, _ = train_step_s1(model, head, head_opt, None, tokens, targets)
             loss_val = float(loss)
-
             if math.isnan(loss_val):
-                raise RuntimeError(f"NaN loss at stage 1 epoch {epoch} batch {batch_idx}")
-
+                raise RuntimeError(f"NaN loss at stage 1 epoch {epoch}")
             epoch_loss += loss_val
             epoch_batches += 1
             total_steps += 1
 
         val_loss, val_pr = evaluate(model, head, val_loader, eval_step_fn)
         is_best = val_pr > best_val_pearson
-
         if is_best:
             best_val_pearson = val_pr
             best_head_state = jax.tree.map(jnp.copy, nnx.state(head))
@@ -309,148 +359,165 @@ if __name__ == "__main__":
 
         stage1_epochs_done = epoch + 1
         avg_loss = epoch_loss / max(epoch_batches, 1)
-        star = "*" if is_best else " "
-        print(
-            f"epoch {epoch:3d} {star} | "
-            f"train_loss: {avg_loss:.6f} | "
-            f"val_r: {val_pr:.4f} (best: {best_val_pearson:.4f}) | "
-            f"elapsed: {time.time() - t_train_start:.0f}s",
-            flush=True,
-        )
+        print(f"epoch {epoch:3d} {'*' if is_best else ' '} | train_loss: {avg_loss:.6f} | "
+              f"val_loss: {val_loss:.4f} | val_r: {val_pr:.4f} (best: {best_val_pearson:.4f}) | "
+              f"elapsed: {time.time() - t_train_start:.0f}s", flush=True)
+        _log_metrics(1, epoch, avg_loss, val_loss, val_pr)
 
         if (epoch + 1) % 5 == 0:
             gc.collect()
-
-        if epochs_since_best >= EARLY_STOPPING_PATIENCE:
+        if epochs_since_best >= S1_EARLY_STOPPING_PATIENCE:
             print(f"early stopped after {stage1_epochs_done} epochs")
             break
 
-    print(f"stage 1 done: {stage1_epochs_done} epochs, best val_pearson: {best_val_pearson:.6f}")
+    # restore best stage-1 head, eval test, save probing checkpoint
+    if best_head_state is not None:
+        nnx.update(head, best_head_state)
+    stage1_test_pearson, stage1_test_mse = test_eval(model, head)
+    with open(STAGE1_CHECKPOINT_PATH, "wb") as f:
+        pickle.dump({
+            "head_state": jax.tree.map(np.asarray, nnx.state(head, nnx.Param)),
+            "backbone_state": None,  # frozen == original pretrained weights
+            "val_pearson": best_val_pearson,
+            "test_pearson": stage1_test_pearson,
+            "test_mse": stage1_test_mse,
+            "stage": 1,
+            "config": {"tissue": TISSUE, "mode": MODE, "model_name": MODEL_NAME},
+        }, f)
+    print(f"stage 1 done: {stage1_epochs_done} epochs | "
+          f"val_pearson={best_val_pearson:.6f} test_pearson={stage1_test_pearson:.6f} "
+          f"test_mse={stage1_test_mse:.6f}")
+    print(f"stage1_checkpoint: {STAGE1_CHECKPOINT_PATH}")
 
     # -------------------------------------------------------------------
-    # Stage 2: unfrozen backbone
+    # Stage 2: unfrozen backbone, full fine-tune (wall-time LR schedule)
     # -------------------------------------------------------------------
 
     stage2_epochs_done = 0
-
-    if STAGE2_ENABLED:
-        if best_head_state is not None:
-            nnx.update(head, best_head_state)
-
-        head_tx_s2 = optax.chain(
-            optax.clip_by_global_norm(1.0),
-            optax.adamw(learning_rate=STAGE2_LR, weight_decay=WEIGHT_DECAY),
+    if RUN_STAGE2:
+        # stage-2 train loader: heavier aug, larger batch
+        train_loader_s2, _, _ = create_dataloaders(
+            data_dir=DATA_DIR, tissue=TISSUE, mode=MODE, batch_size=S2_BATCH_SIZE,
+            reverse_complement=S2_REVERSE_COMPLEMENT, rc_prob=S2_RC_PROB,
+            random_shift=S2_RANDOM_SHIFT, shift_prob=S2_SHIFT_PROB, max_shift=S2_MAX_SHIFT,
+            collate_fn=collate_fn, num_workers=0,
         )
-        head_opt = nnx.Optimizer(head, head_tx_s2)
 
-        backbone_tx = optax.chain(
+        # inject_hyperparams lets us mutate the LR per-step for the wall-time schedule
+        head_opt = nnx.Optimizer(head, optax.chain(
             optax.clip_by_global_norm(1.0),
-            optax.adamw(learning_rate=STAGE2_LR, weight_decay=WEIGHT_DECAY),
-        )
-        backbone_opt = nnx.Optimizer(model, backbone_tx)
-
+            optax.inject_hyperparams(optax.adamw)(learning_rate=S2_BASE_LR, weight_decay=S2_WEIGHT_DECAY),
+        ))
+        backbone_opt = nnx.Optimizer(model, optax.chain(
+            optax.clip_by_global_norm(1.0),
+            optax.inject_hyperparams(optax.adamw)(
+                learning_rate=S2_BASE_LR * S2_BACKBONE_LR_SCALE, weight_decay=S2_WEIGHT_DECAY),
+        ))
         train_step_s2 = make_train_step(get_embeddings, freeze_backbone=False)
 
-        print(f"--- stage 2: unfrozen backbone, lr={STAGE2_LR}, {STAGE2_EPOCHS} epochs ---")
+        print(f"--- stage 2 (full): unfrozen backbone | base_lr={S2_BASE_LR:.1e} "
+              f"backbone_scale={S2_BACKBONE_LR_SCALE} batch={S2_BATCH_SIZE} rc={S2_REVERSE_COMPLEMENT} "
+              f"wd={S2_WEIGHT_DECAY} | wall-time schedule budget={S2_TIME_BUDGET:.0f}s "
+              f"(warmup={S2_WARMUP_RATIO}, warmdown={S2_WARMDOWN_RATIO}, final={S2_FINAL_LR_FRAC}) "
+              f"| max_epochs={S2_MAX_EPOCHS} patience={S2_EARLY_STOPPING_PATIENCE} ---")
 
-        for epoch in range(STAGE2_EPOCHS):
+        s2_epochs_since_best = 0
+        t_stage2_start = time.time()
+        cur_head_lr = S2_BASE_LR
+        timed_out = False
+
+        for epoch in range(S2_MAX_EPOCHS):
             epoch_loss = 0.0
             epoch_batches = 0
 
-            for batch_idx, (tokens_np, targets_np) in enumerate(train_loader):
+            for tokens_np, targets_np in train_loader_s2:
                 tokens = jnp.array(tokens_np)
                 targets = jnp.array(targets_np)
 
+                # per-step wall-time LR schedule (head) + discriminative backbone LR
+                progress = (time.time() - t_stage2_start) / S2_TIME_BUDGET
+                cur_head_lr = S2_BASE_LR * max(lr_multiplier(progress), 0.0)
+                head_opt.opt_state[1].hyperparams["learning_rate"].value = jnp.array(cur_head_lr)
+                backbone_opt.opt_state[1].hyperparams["learning_rate"].value = jnp.array(
+                    cur_head_lr * S2_BACKBONE_LR_SCALE)
+
                 loss, _ = train_step_s2(model, head, head_opt, backbone_opt, tokens, targets)
                 loss_val = float(loss)
-
                 if math.isnan(loss_val):
-                    raise RuntimeError(f"NaN loss at stage 2 epoch {epoch} batch {batch_idx}")
-
+                    raise RuntimeError(f"NaN loss at stage 2 epoch {epoch}")
                 epoch_loss += loss_val
                 epoch_batches += 1
                 total_steps += 1
 
+                if (time.time() - t_stage2_start) >= S2_TIME_BUDGET:
+                    timed_out = True
+                    break
+
             val_loss, val_pr = evaluate(model, head, val_loader, eval_step_fn)
             is_best = val_pr > best_val_pearson
-
             if is_best:
                 best_val_pearson = val_pr
                 best_head_state = jax.tree.map(jnp.copy, nnx.state(head))
                 best_backbone_state = jax.tree.map(jnp.copy, nnx.state(model))
+                s2_epochs_since_best = 0
+            else:
+                s2_epochs_since_best += 1
 
             stage2_epochs_done = epoch + 1
             avg_loss = epoch_loss / max(epoch_batches, 1)
-            star = "*" if is_best else " "
-            print(
-                f"epoch {stage1_epochs_done + epoch:3d} {star} | "
-                f"train_loss: {avg_loss:.6f} | "
-                f"val_r: {val_pr:.4f} (best: {best_val_pearson:.4f}) | "
-                f"elapsed: {time.time() - t_train_start:.0f}s",
-                flush=True,
-            )
+            print(f"epoch {stage1_epochs_done + epoch:3d} {'*' if is_best else ' '} | "
+                  f"train_loss: {avg_loss:.6f} | val_loss: {val_loss:.4f} | "
+                  f"val_r: {val_pr:.4f} (best: {best_val_pearson:.4f}) | lr: {cur_head_lr:.2e} | "
+                  f"t: {time.time() - t_stage2_start:.0f}/{S2_TIME_BUDGET:.0f}s", flush=True)
+            _log_metrics(2, stage1_epochs_done + epoch, avg_loss, val_loss, val_pr, cur_head_lr)
 
             if (epoch + 1) % 5 == 0:
                 gc.collect()
+            if timed_out:
+                print(f"stage 2 wall-time budget reached after {stage2_epochs_done} epochs")
+                break
+            if s2_epochs_since_best >= S2_EARLY_STOPPING_PATIENCE:
+                print(f"stage 2 early stopped after {stage2_epochs_done} epochs")
+                break
 
         print(f"stage 2 done: {stage2_epochs_done} epochs, best val_pearson: {best_val_pearson:.6f}")
 
     gc.enable()
 
-    # restore best weights for final eval
+    # restore overall-best weights for final eval + checkpoint
     if best_head_state is not None:
         nnx.update(head, best_head_state)
     if best_backbone_state is not None:
         nnx.update(model, best_backbone_state)
 
     val_loss, val_pr = evaluate(model, head, val_loader, eval_step_fn)
+    test_pearson, test_mse = test_eval(model, head)
 
-    # test eval — scipy pearsonr for reporting
-    all_preds, all_tgts = [], []
-    for tokens_np, targets_np in test_loader:
-        tokens = jnp.array(tokens_np)
-        enc_out = get_embeddings(model, tokens)
-        preds = head(enc_out)
-        all_preds.append(np.asarray(preds))
-        all_tgts.append(np.asarray(targets_np))
-
-    preds_np = np.concatenate(all_preds)
-    tgts_np = np.concatenate(all_tgts)
-    test_pearson_scipy, _ = pearsonr(preds_np, tgts_np)
-    test_mse = float(np.mean((preds_np - tgts_np) ** 2))
-
-    t_end = time.time()
     backend = jax.default_backend()
-    if backend == "gpu":
-        peak_vram_mb = jax.local_devices()[0].memory_stats().get("peak_bytes_in_use", 0) / 1024 / 1024
-    else:
-        peak_vram_mb = 0.0
+    peak_vram_mb = (jax.local_devices()[0].memory_stats().get("peak_bytes_in_use", 0) / 1024 / 1024
+                    if backend == "gpu" else 0.0)
 
     print("---")
     print(f"val_pearson:      {best_val_pearson:.6f}")
     print(f"val_mse:          {val_loss:.6f}")
-    print(f"test_pearson:     {test_pearson_scipy:.6f}")
+    print(f"test_pearson:     {test_pearson:.6f}")
     print(f"test_mse:         {test_mse:.6f}")
-    print(f"training_seconds: {time.time() - t_train_start:.1f}")
-    print(f"total_seconds:    {t_end - t_start:.1f}")
+    print(f"stage1_test_pearson: {stage1_test_pearson:.6f}")
+    print(f"total_seconds:    {time.time() - t_start:.1f}")
     print(f"peak_vram_mb:     {peak_vram_mb:.1f}")
-    print(f"num_epochs:       {stage1_epochs_done + stage2_epochs_done}")
-    print(f"num_steps:        {total_steps}")
     print(f"tissue:           {TISSUE}")
     print(f"mode:             {MODE}")
     print(f"stage1_epochs:    {stage1_epochs_done}")
     print(f"stage2_epochs:    {stage2_epochs_done}")
 
-    # only save trainable Param leaves; nnx.state(.) without a filter includes the
-    # dropout RngStream (PRNGKey dtype) which can't be np.asarray'd.
-    head_params = nnx.state(head, nnx.Param)
-    backbone_params = nnx.state(model, nnx.Param) if STAGE2_ENABLED else None
-
+    # final ("full fine-tune") checkpoint: head + fine-tuned backbone (if stage 2 ran)
     ckpt = {
-        "head_state": jax.tree.map(np.asarray, head_params),
-        "backbone_state": jax.tree.map(np.asarray, backbone_params) if backbone_params is not None else None,
+        "head_state": jax.tree.map(np.asarray, nnx.state(head, nnx.Param)),
+        "backbone_state": jax.tree.map(np.asarray, nnx.state(model, nnx.Param)) if RUN_STAGE2 else None,
         "val_pearson": best_val_pearson,
-        "test_pearson": test_pearson_scipy,
+        "test_pearson": test_pearson,
+        "test_mse": test_mse,
+        "stage": 2 if RUN_STAGE2 else 1,
         "config": {"tissue": TISSUE, "mode": MODE, "model_name": MODEL_NAME},
     }
     with open(CHECKPOINT_PATH, "wb") as f:
