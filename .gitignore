@@ -32,3 +32,11 @@ jores21-raw/
 .vscode/
 .idea/
 .DS_Store
+
+# experiment scratch (sweep configs, one-off collectors, job-id files)
+sweep_configs/
+_collect_reg.py
+.reg_jobs
+.s1curve_jobs
+.run_job
+.reg_smoke
